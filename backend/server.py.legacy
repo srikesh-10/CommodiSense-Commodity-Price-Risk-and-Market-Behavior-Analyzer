@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""CommodiSense analysis backend.
+
+Implements the API contract in src/lib/api.ts on port 8000 (VITE_API_BASE_URL).
+Deterministic synthetic gold/crude-oil series (seeded), real analytics:
+k-means, GMM (EM), agglomerative clustering, PCA, Gaussian HMM (EM),
+historical VaR/CVaR and rolling statistics — all with numpy only.
+
+Run:  python3 backend/server.py   (listens on 0.0.0.0:8000)
+"""
+import json
+import math
+import time
+from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import numpy as np
+
+VERSION = "1.0.0"
+PROVIDER = "synthetic-preloaded"
+DATA_SOURCE = "demo"
+END = date(2026, 10, 16)
+BUSINESS_DAYS = 2600  # ~10 years of daily observations
+SEED = 1337
+
+# ----------------------------------------------------------------------------
+# Synthetic market data (deterministic)
+# ----------------------------------------------------------------------------
+
+def _business_days(end: date, n: int) -> list[date]:
+    out, d = [], end
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return list(reversed(out))
+
+
+DATES = _business_days(END, BUSINESS_DAYS)
+
+
+def _simulate(seed: int, start_price: float, regimes: dict, trans: np.ndarray, jump: float) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = len(DATES)
+    keys = list(regimes)
+    state = 1  # start in "sideways"
+    prices = np.empty(n)
+    p = start_price
+    for i in range(n):
+        if i > 0 and rng.random() < 0.03:
+            p *= 1 + jump * rng.standard_t(4) / 100  # rare fat-tail shock
+        drift, vol = regimes[keys[state]]
+        p *= math.exp(drift + vol * rng.standard_normal())
+        prices[i] = p
+        if rng.random() < 0.02:
+            state = int(rng.choice(len(keys), p=trans[state]))
+    return prices
+
+
+_REG = {"bull": (0.00055, 0.008), "bear": (-0.00045, 0.011), "sideways": (0.00005, 0.006), "highvol": (0.0, 0.019)}
+_TRANS = np.array([[0.985, 0.005, 0.005, 0.005],
+                   [0.005, 0.985, 0.005, 0.005],
+                   [0.004, 0.004, 0.988, 0.004],
+                   [0.01, 0.01, 0.01, 0.97]])
+GOLD = _simulate(SEED, 1850.0, {"bull": (0.00050, 0.007), "bear": (-0.00040, 0.009), "sideways": (0.00003, 0.005), "highvol": (0.0, 0.014)}, _TRANS, 0.4)
+OIL = _simulate(SEED + 7, 72.0, {"bull": (0.00070, 0.016), "bear": (-0.00060, 0.020), "sideways": (0.00002, 0.013), "highvol": (0.0, 0.030)}, _TRANS, 1.2)
+
+PRICES = {"gold": GOLD, "oil": OIL}
+COMMODITIES = ("gold", "oil")
+FIRST_REFRESH_LOCK = __import__("threading").Lock()
+LAST_REFRESH = {"t": 0.0}
+
+
+def _log_returns(p: np.ndarray) -> np.ndarray:
+    return np.diff(np.log(p), prepend=np.nan)
+
+
+def _rolling_vol(r: np.ndarray, window: int = 20) -> np.ndarray:
+    out = np.full_like(r, np.nan)
+    for i in range(window, len(r)):
+        w = r[i - window + 1: i + 1]
+        w = w[~np.isnan(w)]
+        if len(w) >= window - 5:
+            out[i] = float(np.nanstd(w) * math.sqrt(252) * 100)
+    return out
+
+
+def _momentum(p: np.ndarray, window: int = 20) -> np.ndarray:
+    out = np.full_like(p, np.nan)
+    out[window:] = (p[window:] / p[:-window] - 1.0) * 100
+    return out
+
+
+def _range_pct(p: np.ndarray) -> np.ndarray:
+    rng = np.random.default_rng(SEED + 99)
+    return np.abs(rng.normal(0, 0.9, size=p.shape)) + np.abs(_log_returns(p)) * 40
+
+
+def _roll_corr(a: np.ndarray, b: np.ndarray, window: int = 20) -> np.ndarray:
+    out = np.full_like(a, np.nan)
+    for i in range(window - 1, len(a)):
+        x, y = a[i - window + 1: i + 1], b[i - window + 1: i + 1]
+        m = ~(np.isnan(x) | np.isnan(y))
+        if m.sum() >= window * 0.7:
+            xs, ys = x[m], y[m]
+            if xs.std() > 0 and ys.std() > 0:
+                out[i] = float(np.corrcoef(xs, ys)[0, 1])
+    return out
+
+
+RET = {c: _log_returns(PRICES[c]) for c in COMMODITIES}
+VOL = {c: _rolling_vol(RET[c]) for c in COMMODITIES}
+MOM = {c: _momentum(PRICES[c]) for c in COMMODITIES}
+RNG_PCT = {c: _range_pct(PRICES[c]) for c in COMMODITIES}
+CORR_ROLL = _roll_corr(RET["gold"], RET["oil"])
+
+FEATURE_FUNCS = {
+    "log_return": lambda c: RET[c] * 100,
+    "rolling_vol_20": lambda c: VOL[c],
+    "momentum_20": lambda c: MOM[c],
+    "range_pct": lambda c: RNG_PCT[c],
+}
+
+
+# ----------------------------------------------------------------------------
+# Period / interval helpers
+# ----------------------------------------------------------------------------
+
+PERIOD_DAYS = {"1m": 31, "3m": 92, "6m": 183, "1y": 365, "5y": 1826, "all": None}
+
+
+def _slice(period: str):
+    days = PERIOD_DAYS.get(period)
+    if days is None:
+        return 0
+    cutoff = DATES[-1] - timedelta(days=days)
+    for i, d in enumerate(DATES):
+        if d >= cutoff:
+            return i
+    return 0
+
+
+def _agg(dates: list[date], closes: np.ndarray, interval: str):
+    if interval == "daily":
+        return dates, closes
+    keys = [d.strftime("%G-W%V") if interval == "weekly" else d.strftime("%Y-%m") for d in dates]
+    last: dict[str, int] = {}
+    for i, k in enumerate(keys):
+        last[k] = i
+    idx = sorted(last.values())
+    return [dates[i] for i in idx], closes[idx]
+
+
+def _points(commodity: str, period: str, interval: str):
+    i0 = _slice(period)
+    dates = DATES[i0:]
+    closes = PRICES[commodity][i0:]
+    dates, closes = _agg(dates, closes, interval)
+    r = _log_returns(closes) * 100
+    vol = _rolling_vol(r)
+    pts = []
+    for i, d in enumerate(dates):
+        pt = {"date": d.isoformat(), "close": round(float(closes[i]), 2)}
+        if not math.isnan(r[i]):
+            pt["return_pct"] = round(float(r[i]), 4)
+        if not math.isnan(vol[i]):
+            pt["rolling_vol"] = round(float(vol[i]), 3)
+        pts.append(pt)
+    return pts
+
+
+def _coverage():
+    out = []
+    for c in COMMODITIES:
+        p = PRICES[c]
+        gaps = int(np.isnan(p).sum())
+        out.append({
+            "commodity": c,
+            "start": DATES[0].isoformat(),
+            "end": DATES[-1].isoformat(),
+            "observations": int((~np.isnan(p)).sum()),
+            "missing_days": gaps,
+            "intervals": ["daily", "weekly", "monthly"],
+        })
+    return out
+
+
+def _quality():
+    outliers = {c: int((np.abs(np.nan_to_num(RET[c])) > 0.05).sum()) for c in COMMODITIES}
+    return {"duplicates": 0, "gaps": 0, "outliers": sum(outliers.values()),
+            "notes": ["Synthetic deterministic series (seeded); outliers retained intentionally."]}
+
+
+# ----------------------------------------------------------------------------
+# Analytics primitives
+# ----------------------------------------------------------------------------
+
+def _scale(x: np.ndarray, method: str) -> np.ndarray:
+    x = np.nan_to_num(x, nan=0.0)
+    if method == "minmax":
+        lo, hi = x.min(0), x.max(0)
+        rng = np.where(hi - lo == 0, 1, hi - lo)
+        return (x - lo) / rng
+    if method == "robust":
+        med = np.median(x, 0)
+        iqr = np.subtract(*np.percentile(x, [75, 25], axis=0))
+        iqr = np.where(iqr == 0, 1, iqr)
+        return (x - med) / iqr
+    mu, sd = x.mean(0), x.std(0)
+    sd = np.where(sd == 0, 1, sd)
+    return (x - mu) / sd
+
+
+def _kmeans(x: np.ndarray, k: int, seed: int, iters: int = 100):
+    rng = np.random.default_rng(seed)
+    n = len(x)
+    centers = [x[rng.integers(n)]]
+    for _ in range(k - 1):
+        d2 = np.min(((x[:, None, :] - np.array(centers)[None]) ** 2).sum(-1), axis=1)
+        centers.append(x[rng.choice(n, p=d2 / d2.sum())])
+    c = np.array(centers)
+    labels = np.zeros(n, dtype=int)
+    for _ in range(iters):
+        d = ((x[:, None, :] - c[None]) ** 2).sum(-1)
+        new = d.argmin(1)
+        if (new == labels).all() and _ > 0:
+            break
+        labels = new
+        for j in range(k):
+            m = labels == j
+            if m.any():
+                c[j] = x[m].mean(0)
+            else:
+                c[j] = x[rng.integers(n)]
+    inertia = float(((x - c[labels]) ** 2).sum())
+    return labels, c, inertia
+
+
+def _gmm(x: np.ndarray, k: int, seed: int, iters: int, cov_type: str = "full"):
+    rng = np.random.default_rng(seed)
+    n, d = x.shape
+    labels, centers, _ = _kmeans(x, k, seed, 30)
+    mu = centers.copy()
+    covs = np.array([np.cov(x.T) + np.eye(d) * 1e-3 for _ in range(k)]) if d > 1 else np.full((k, 1, 1), x.var() + 1e-3)
+    w = np.full(k, 1 / k)
+    resp = None
+    prev_ll = -np.inf
+    for _ in range(max(1, iters)):
+        try:
+            lpdf = np.empty((n, k))
+            for j in range(k):
+                if cov_type == "spherical":
+                    s = np.mean(np.diag(covs[j])) * np.eye(d)
+                elif cov_type == "diag":
+                    s = np.diag(np.diag(covs[j]))
+                else:
+                    s = covs[j]
+                s = s + np.eye(d) * 1e-6
+                inv = np.linalg.inv(s)
+                diff = x - mu[j]
+                lpdf[:, j] = -0.5 * (np.log(np.linalg.det(s)) + d * math.log(2 * math.pi) + ((diff @ inv) * diff).sum(1))
+            log_joint = np.log(np.maximum(w, 1e-12)) + lpdf
+            m = log_joint.max(1, keepdims=True)
+            log_norm = m + np.log(np.exp(log_joint - m).sum(1, keepdims=True))
+            ll = float(log_norm.sum())
+            resp = np.exp(log_joint - log_norm)
+            w = resp.mean(0)
+            w = w / w.sum()
+            nk = resp.sum(0) + 1e-8
+            mu = (resp.T @ x) / nk[:, None]
+            for j in range(k):
+                diff = x - mu[j]
+                covs[j] = (resp[:, j][:, None] * diff).T @ diff / nk[j] + np.eye(d) * 1e-4
+        except np.linalg.LinAlgError:
+            break
+        if abs(ll - prev_ll) < 1e-6 * (abs(prev_ll) + 1):
+            break
+        prev_ll = ll
+    if resp is None:
+        labels, centers, _ = _kmeans(x, k, seed, 30)
+        return labels, centers, np.full(k, 1 / k), float("nan"), np.eye(k)[labels]
+    labels = resp.argmax(1)
+    return labels, mu, w, prev_ll, resp
+
+
+def _pca(x: np.ndarray, n_comp: int):
+    xc = x - x.mean(0)
+    u, s, vt = np.linalg.svd(xc, full_matrices=False)
+    var = s ** 2
+    ratios = (var / var.sum())[:n_comp]
+    proj = u[:, :n_comp] * s[:n_comp]
+    return proj, [float(r) for r in ratios]
+
+
+def _hierarchical(x: np.ndarray, k: int, seed: int):
+    n = len(x)
+    if n > 500:
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(n, 500, replace=False))
+    else:
+        idx = np.arange(n)
+    xs = x[idx]
+    n_s = len(xs)
+    dist = np.sqrt(((xs[:, None, :] - xs[None]) ** 2).sum(-1))
+    M = dist.copy()
+    np.fill_diagonal(M, np.inf)
+    members = {i: [i] for i in range(n_s)}
+    active = np.ones(n_s, dtype=bool)
+    for _ in range(n_s - k):
+        flat = int(np.argmin(M[np.ix_(active, active)]))
+        ai = np.where(active)[0]
+        a, b = ai[flat // len(ai)], ai[flat % len(ai)]
+        members[a] += members[b]
+        members.pop(b, None)
+        active[b] = False
+        keys = list(members)
+        vals = np.array([dist[members[a]][:, members[c]].mean() if c != a else np.inf
+                         for c in keys])
+        row = np.full(n_s, np.inf)
+        row[keys] = vals
+        M[a, :] = row
+        M[:, a] = row
+        M[b, :] = np.inf
+        M[:, b] = np.inf
+    group_ids = {p: gi for gi, cl in enumerate(members.values()) for p in cl}
+    centers = np.array([xs[[i for i, g in group_ids.items() if g == gi]].mean(0)
+                        for gi in sorted(set(group_ids.values()))])
+    d_all = ((x[:, None, :] - centers[None]) ** 2).sum(-1)
+    return d_all.argmin(1), centers
+
+
+def _silhouette(x: np.ndarray, labels: np.ndarray) -> float:
+    uniq = np.unique(labels)
+    if len(uniq) < 2 or len(x) > 800:
+        return float("nan")
+    d = np.sqrt(((x[:, None, :] - x[None]) ** 2).sum(-1))
+    s = []
+    for i in range(len(x)):
+        own = labels == labels[i]
+        if own.sum() <= 1:
+            s.append(0.0)
+            continue
+        a = d[i][own].sum() / (own.sum() - 1)
+        b = min(d[i][labels == g].mean() for g in uniq if g != labels[i])
+        s.append((b - a) / max(a, b))
+    return float(np.mean(s))
+
+
+def _davies_bouldin(x: np.ndarray, labels: np.ndarray, centers: np.ndarray) -> float:
+    k = len(centers)
+    scatter = []
+    for j in range(k):
+        m = labels == j
+        scatter.append(float(np.sqrt(((x[m] - centers[j]) ** 2).sum(1).mean())) if m.any() else 0.0)
+    db = 0.0
+    for i in range(k):
+        db += max((scatter[i] + scatter[j]) / (np.linalg.norm(centers[i] - centers[j]) + 1e-12)
+                  for j in range(k) if j != i)
+    return db / k
+
+
+def _calinski(x: np.ndarray, labels: np.ndarray) -> float:
+    n, k = len(x), len(np.unique(labels))
+    if k < 2:
+        return float("nan")
+    mu = x.mean(0)
+    bg = sum((labels == j).sum() * np.linalg.norm(x[labels == j].mean(0) - mu) ** 2 for j in np.unique(labels))
+    wg = sum(((x[labels == j] - x[labels == j].mean(0)) ** 2).sum() for j in np.unique(labels))
+    return float((bg / (k - 1)) / (wg / (n - k) + 1e-12))
+
+
+def _hmm_em(x: np.ndarray, k: int, iters: int, cov_type: str, seed: int):
+    """Gaussian HMM trained with Baum-Welch EM. x: (n, d). Returns None on failure."""
+    rng = np.random.default_rng(seed)
+    n, d = x.shape
+    if n < 4 * k:
+        return None
+    labels, mu, _, _, _ = _gmm(x, k, seed, 20)
+    covs = np.array([np.cov(x[labels == j].T) if (labels == j).sum() > d else np.eye(d)
+                     for j in range(k)]) + np.eye(d) * 1e-3
+    if covs.shape == (k,):  # d == 1 edge
+        covs = covs.reshape(k, 1, 1)
+    pi = np.full(k, 1 / k)
+    trans = np.full((k, k), 0.1)
+    np.fill_diagonal(trans, 0.8)
+    trans /= trans.sum(1, keepdims=True)
+    prev_ll = -np.inf
+    for _ in range(max(2, iters)):
+        # emission log-likelihoods
+        logb = np.empty((n, k))
+        try:
+            for j in range(k):
+                if cov_type == "spherical":
+                    s = np.mean(np.diag(covs[j])) * np.eye(d)
+                elif cov_type == "diag":
+                    s = np.diag(np.diag(covs[j]))
+                else:
+                    s = covs[j]
+                s = s + np.eye(d) * 1e-6
+                inv = np.linalg.inv(s)
+                diff = x - mu[j]
+                logb[:, j] = -0.5 * (np.log(np.linalg.det(s)) + d * math.log(2 * math.pi) + ((diff @ inv) * diff).sum(1))
+        except np.linalg.LinAlgError:
+            return None
+        # scaled forward-backward in linear space
+        scale = np.empty(n)
+        A = trans.copy()
+        B = np.exp(logb - logb.max(1, keepdims=True))
+        g = pi * B[0]
+        scale[0] = g.sum()
+        g = g / scale[0]
+        gamma = np.empty((n, k))
+        gamma[0] = g
+        xi_sum = np.zeros((k, k))
+        alphas = [g]
+        for t in range(1, n):
+            g = (alphas[-1] @ A) * B[t]
+            s_ = g.sum()
+            if s_ <= 0:
+                return None
+            scale[t] = s_
+            g = g / s_
+            gamma[t] = g
+            alphas.append(g)
+        loglike = float(np.log(scale).sum())
+        betas = [np.ones(k)]
+        for t in range(n - 2, -1, -1):
+            b_next = (A * B[t + 1] * betas[0]) @ np.ones(k)
+            s_ = b_next.sum()
+            b_next = b_next / (s_ + 1e-300)
+            betas.insert(0, b_next)
+        for t in range(n - 1):
+            xi = (alphas[t][:, None] * A * (B[t + 1] * betas[n - 1 - t])[None, :])
+            s_ = xi.sum()
+            if s_ > 0:
+                xi_sum += xi / s_
+        trans = np.maximum(xi_sum, 1e-8)
+        trans /= trans.sum(1, keepdims=True)
+        pi = gamma[0] + 1e-8
+        pi /= pi.sum()
+        w = gamma.sum(0) + 1e-8
+        mu = (gamma.T @ x) / w[:, None]
+        for j in range(k):
+            diff = x - mu[j]
+            covs[j] = (gamma[:, j][:, None] * diff).T @ diff / w[j] + np.eye(d) * 1e-4
+            if cov_type == "diag":
+                covs[j] = np.diag(np.diag(covs[j]))
+            elif cov_type == "spherical":
+                covs[j] = np.mean(np.diag(covs[j])) * np.eye(d)
+        if abs(loglike - prev_ll) < 1e-4 * (abs(prev_ll) + 1):
+            break
+        prev_ll = loglike
+    if not np.isfinite(prev_ll):
+        return None
+    return {"mu": mu, "covs": covs, "trans": trans, "pi": pi, "loglike": prev_ll, "gamma": gamma}
+
+
+def _risk_block(commodity: str, i0: int, var_conf: float, vol_window: int, sensitivity: str):
+    closes = PRICES[commodity][i0:]
+    r = np.nan_to_num(RET[commodity][i0:])
+    peak = np.maximum.accumulate(closes)
+    mdd = float(((closes / peak) - 1).min() * 100)
+    var = float(-np.percentile(r, (1 - var_conf) * 100) * 100)
+    tail = r[r <= np.percentile(r, (1 - var_conf) * 100)]
+    cvar = float(-tail.mean() * 100) if len(tail) else var
+    av = float(np.nanstd(r[-252:]) * math.sqrt(252) * 100)
+    sharpe = float(np.nanmean(r) * 252 * 100 / (av + 1e-9))
+    high = {"conservative": 50, "balanced": 66, "aggressive": 80}[sensitivity]
+    return {"max_drawdown": round(mdd, 2), "var": round(var, 2), "cvar": round(cvar, 2),
+            "annual_vol": round(av, 2), "sharpe": round(sharpe, 3)}, \
+        {"var_confidence": var_conf, "vol_window": vol_window, "high_risk_score": high}
+
+
+# ----------------------------------------------------------------------------
+# Analysis runner
+# ----------------------------------------------------------------------------
+
+def run_analysis(body: dict) -> dict:
+    commodities = [c for c in body.get("commodities", ["gold", "oil"]) if c in COMMODITIES] or ["gold"]
+    period = body.get("period", "1y")
+    interval = body.get("interval", "daily")
+    objective = body.get("objective", "patterns")
+    features = [f for f in body.get("features", ["log_return"]) if f in FEATURE_FUNCS or f == "gold_oil_corr"]
+    scaling = body.get("scaling", "standard")
+    seed = int(body.get("random_state", 42))
+    metrics_req = body.get("metrics", [])
+    i0 = _slice(period)
+    dates = DATES[i0:]
+    if interval != "daily":
+        # aggregate closes, recompute per-date features on aggregated closes
+        keys = [d.strftime("%G-W%V") if interval == "weekly" else d.strftime("%Y-%m") for d in dates]
+        last = {}
+        for i, k in enumerate(keys):
+            last[k] = i
+        keep = sorted(last.values())
+        dates = [dates[i] for i in keep]
+        for c in COMMODITIES:
+            closes = PRICES[c][i0:][keep]
+            PRICES[f"agg_{c}"] = closes
+            RET[f"agg_{c}"] = _log_returns(closes)
+            VOL[f"agg_{c}"] = _rolling_vol(RET[f"agg_{c}"])
+            MOM[f"agg_{c}"] = _momentum(closes)
+            RNG_PCT[f"agg_{c}"] = _range_pct(closes)
+        cc = "gold" if interval == "daily" else f"agg_gold"
+        oc = "oil" if interval == "daily" else f"agg_oil"
+        corr_roll = _roll_corr(RET[cc], RET[oc])
+        src = {c: f"agg_{c}" for c in COMMODITIES}
+    else:
+        corr_roll = CORR_ROLL[i0:]
+        src = {c: c for c in COMMODITIES}
+
+    n = len(dates)
+    # ---- series
+    series = []
+    for i in range(n):
+        row = {"date": dates[i].isoformat()}
+        for c in commodities:
+            key = "gold" if c == "gold" else "oil"
+            row[key] = round(float(PRICES[src[c]][i]), 2)
+            r = RET[src[c]][i] * 100
+            if not math.isnan(r):
+                row[f"{key}_return"] = round(float(r), 4)
+            v = VOL[src[c]][i]
+            if not math.isnan(v):
+                row[f"{key}_vol"] = round(float(v), 3)
+        series.append(row)
+
+    result: dict = {
+        "run_id": f"run-{int(time.time() * 1000)}-{seed}",
+        "source": DATA_SOURCE,
+        "period": {"start": dates[0].isoformat(), "end": dates[-1].isoformat(),
+                   "requested": period, "note": None},
+        "series": series,
+    }
+
+    # ---- feature matrix (per date; concatenate across commodities)
+    cols, names = [], []
+    for feat in features:
+        if feat == "gold_oil_corr":
+            if "oil" in commodities and "gold" in commodities:
+                cols.append(np.nan_to_num(corr_roll))
+                names.append(feat)
+            continue
+        for c in commodities:
+            arr = FEATURE_FUNCS[feat](src[c])
+            cols.append(np.nan_to_num(arr if interval != "daily" else arr[i0:]))
+            names.append(f"{c}_{feat}")
+    X = _scale(np.column_stack(cols), scaling)
+    evaluation: dict = {}
+
+    # ---- clustering
+    if objective in ("patterns", "compare"):
+        cl = body.get("clustering") or {}
+        k = int(cl.get("n_clusters", 3))
+        n_comp = int(cl.get("pca_components", 2))
+        algo = cl.get("algorithm", "kmeans")
+        n_comp = min(n_comp, X.shape[1])
+        proj, ratios = _pca(X, n_comp)
+        if algo == "kmeans":
+            labels, centers, inertia = _kmeans(proj, k, seed)
+            evaluation["inertia"] = round(inertia, 2)
+        elif algo == "gmm":
+            labels, centers, _, ll, _ = _gmm(proj, k, seed, 100)
+            evaluation["log_likelihood"] = round(float(ll), 2)
+            evaluation["aic"] = round(2 * k * (proj.shape[1] + proj.shape[1] * (proj.shape[1] + 1) / 2 + k - 1) - 2 * ll, 2)
+            evaluation["bic"] = round(math.log(n) * k * (proj.shape[1] + proj.shape[1] * (proj.shape[1] + 1) / 2 + k - 1) - 2 * ll, 2)
+        else:
+            labels, centers = _hierarchical(proj, k, seed)
+        clusters = []
+        for j in range(len(centers)):
+            m = labels == j
+            clusters.append({"id": j, "size": int(m.sum()),
+                             "centroid": {f"pc{d + 1}": round(float(centers[j][d]), 4) for d in range(len(centers[j]))}})
+        pts = [{"date": dates[i].isoformat(), "cluster": int(labels[i]),
+                **{f"pc{d + 1}": round(float(proj[i][d]), 4) for d in range(proj.shape[1])}} for i in range(n)]
+        ev = [round(r, 6) for r in ratios]
+        cl_metrics = {}
+        for m in metrics_req:
+            if m == "silhouette":
+                cl_metrics["silhouette"] = round(_silhouette(proj, labels), 4)
+            elif m == "davies_bouldin":
+                cl_metrics["davies_bouldin"] = round(_davies_bouldin(proj, labels, centers), 4)
+            elif m == "calinski_harabasz":
+                cl_metrics["calinski_harabasz"] = round(_calinski(proj, labels), 1)
+        result["clustering"] = {"algorithm": algo, "clusters": clusters, "points": pts,
+                                "explained_variance": ev, "metrics": cl_metrics}
+        result["evaluation"] = {**result.get("evaluation", {}), **cl_metrics}
+
+    # ---- HMM
+    if objective in ("states", "compare"):
+        h = body.get("hmm") or {}
+        k = int(h.get("n_states", 3))
+        iters = int(h.get("n_iter", 200))
+        cov_type = h.get("covariance_type", "full")
+        gold_ret = np.nan_to_num(RET[src[commodities[0]]][i0:]) * 100
+        gold_vol = np.nan_to_num(VOL[src[commodities[0]]][i0:])
+        obs = np.column_stack([gold_ret, gold_vol])
+        fit = _hmm_em(obs, k, iters, cov_type, seed)
+        if fit is not None:
+            gamma, mu = fit["gamma"], fit["mu"]
+            states = gamma.argmax(1)
+            # relabel states by mean return (bear -> bull)
+            order = np.argsort([mu[j, 0] for j in range(k)])
+            remap = np.empty(k, dtype=int)
+            for new, old in enumerate(order):
+                remap[old] = new
+            states = remap[states]
+            gamma_r = gamma[:, order]
+            probs = gamma_r.max(1)
+            timeline = [{"date": dates[i].isoformat(), "state": int(states[i]), "prob": round(float(probs[i]), 4)} for i in range(n)]
+            sstats = []
+            for j in range(k):
+                m = states == j
+                rj = gold_ret[m]
+                sstats.append({"state": j, "mean_return": round(float(rj.mean()), 4),
+                               "volatility": round(float(np.nanstd(VOL[src[commodities[0]]][i0:][m])), 3),
+                               "share": round(float(m.mean()), 4)})
+            trans = fit["trans"][np.ix_(order, order)]
+            trans = trans / trans.sum(1, keepdims=True)
+            d = obs.shape[1]
+            n_params = k * k + k * d * 2 - 1
+            result["hmm"] = {
+                "n_states": k,
+                "timeline": timeline,
+                "transition_matrix": [[round(float(v), 4) for v in row] for row in trans],
+                "state_stats": sstats,
+                "log_likelihood": round(float(fit["loglike"]), 2),
+                "aic": round(2 * n_params - 2 * fit["loglike"], 2),
+                "bic": round(math.log(n) * n_params - 2 * fit["loglike"], 2),
+            }
+            for m in ("log_likelihood", "aic", "bic"):
+                if m in metrics_req:
+                    evaluation[m] = result["hmm"][m]
+
+    # ---- risk
+    risk_out: dict = {}
+    thresholds = None
+    if objective in ("risk", "compare"):
+        rk = body.get("risk") or {}
+        conf = float(rk.get("var_confidence", 0.95))
+        vw = int(rk.get("vol_window", 20))
+        sens = rk.get("sensitivity", "balanced")
+        for c in commodities:
+            blk, thresholds = _risk_block(c, i0, conf, vw, sens)
+            risk_out["gold" if c == "gold" else "oil"] = blk
+        risk_out["thresholds"] = thresholds
+        result["risk"] = risk_out
+
+    # ---- correlation
+    if len(commodities) > 1:
+        a = np.nan_to_num(RET[src["gold"]][i0:])
+        b = np.nan_to_num(RET[src["oil"]][i0:])
+        pear = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else 0.0
+        rolling = [{"date": dates[i].isoformat(), "value": round(float(corr_roll[i]), 4)}
+                   for i in range(n) if not math.isnan(corr_roll[i])]
+        result["correlation"] = {"pearson": round(pear, 4), "rolling": rolling}
+
+    result["evaluation"] = {**result.get("evaluation", {}), **evaluation}
+    result["evaluation"] = {k: v for k, v in result["evaluation"].items() if not (isinstance(v, float) and math.isnan(v))}
+
+    methodology = [
+        f"Window: {dates[0].isoformat()} to {dates[-1].isoformat()} ({n} {interval} observations).",
+        f"Features: {', '.join(names)}; scaling: {scaling}.",
+    ]
+    if "clustering" in result:
+        methodology.append(f"Clustering: {result['clustering']['algorithm']} in {n_comp}-D PCA space (explained variance {', '.join(f'{r * 100:.1f}%' for r in ratios)}).")
+    if "hmm" in result:
+        methodology.append(f"Hidden Markov model: {k} Gaussian states, {cov_type} covariance, {iters} EM iterations.")
+    if "risk" in result:
+        methodology.append(f"Risk: historical VaR/CVaR at {conf:.0%}, {vw}-day volatility window ({sens} sensitivity).")
+    result["methodology"] = methodology
+
+    parts = []
+    if "clustering" in result:
+        parts.append(f"{len(result['clustering']['clusters'])} {result['clustering']['algorithm']} regimes identified")
+    if "hmm" in result:
+        dominant = max(result["hmm"]["state_stats"], key=lambda s: s["share"])
+        parts.append(f"dominant HMM state #{dominant['state']} ({dominant['share']:.0%} of days)")
+    if "risk" in result and "gold" in risk_out:
+        parts.append(f"gold 1-day VaR {risk_out['gold']['var']:.2f}%")
+    if "correlation" in result:
+        parts.append(f"gold-oil correlation {result['correlation']['pearson']:.2f}")
+    result["summary"] = ("Analysis of " + " & ".join(commodities) + ": " + "; ".join(parts) + ".")
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Auxiliary contract endpoints
+# ----------------------------------------------------------------------------
+
+def run_model(path: str, body: dict) -> dict:
+    period = body.get("period", "1y")
+    i0 = _slice(period)
+    feats = body.get("features", ["log_return", "rolling_vol_20"])
+    feats = [f for f in feats if f in FEATURE_FUNCS]
+    cols = []
+    for c in ("gold", "oil"):
+        for f in feats:
+            cols.append(np.nan_to_num(FEATURE_FUNCS[f](c)[i0:]))
+    X = _scale(np.column_stack(cols), body.get("scaling", "standard"))
+    seed = int(body.get("random_state", 42))
+    k = int(body.get("n_clusters", 3))
+    proj, ratios = _pca(X, min(3, X.shape[1]))
+    if "kmeans" in path:
+        labels, centers, inertia = _kmeans(proj, k, seed)
+        return {"algorithm": "kmeans", "labels": labels.tolist(), "explained_variance": ratios,
+                "inertia": round(inertia, 2), "silhouette": round(_silhouette(proj, labels), 4)}
+    if "gmm" in path:
+        labels, centers, w, ll, _ = _gmm(proj, k, seed, 100)
+        return {"algorithm": "gmm", "labels": labels.tolist(), "explained_variance": ratios,
+                "log_likelihood": round(float(ll), 2)}
+    if "hierarchical" in path:
+        labels, centers = _hierarchical(proj, k, seed)
+        return {"algorithm": "hierarchical", "labels": labels.tolist(), "explained_variance": ratios}
+    if "pca" in path:
+        return {"explained_variance": ratios, "n_components": len(ratios)}
+    if "hmm" in path:
+        obs = np.column_stack([np.nan_to_num(RET["gold"][i0:]) * 100, np.nan_to_num(VOL["gold"][i0:])])
+        if "infer" in path:
+            fit = _hmm_em(obs, int(body.get("n_states", 3)), 50, "full", seed)
+            if fit is None:
+                return {"error": "insufficient data"}
+            states = fit["gamma"].argmax(1)
+            return {"states": states.tolist(), "transition_matrix": fit["trans"].round(4).tolist()}
+        fit = _hmm_em(obs, int(body.get("n_states", 3)), int(body.get("n_iter", 200)), body.get("covariance_type", "full"), seed)
+        if fit is None:
+            return {"error": "insufficient data"}
+        return {"log_likelihood": round(float(fit["loglike"]), 2), "n_states": int(body.get("n_states", 3))}
+    if "risk" in path:
+        blk, th = _risk_block("gold", i0, 0.95, 20, "balanced")
+        return {"gold": blk, "thresholds": th}
+    if "experiments" in path:
+        return {"experiments": [
+            {"id": f"exp-{a}-{k2}", "algorithm": a, "n_clusters": k2,
+             "silhouette": round(_silhouette(proj, lab), 4)}
+            for a, runner in (("kmeans", _kmeans),) for k2 in (2, 3, 4, 5)
+            for lab, _, _ in [runner(proj, k2, seed)]
+        ]}
+    return {"error": "unknown endpoint"}
+
+
+# ----------------------------------------------------------------------------
+# HTTP server
+# ----------------------------------------------------------------------------
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+def _clean(o):
+    """Recursively replace NaN/Infinity so JSON stays valid."""
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_clean(v) for v in o]
+    if isinstance(o, (float, np.floating)):
+        f = float(o)
+        return None if not math.isfinite(f) else round(f, 6) if abs(f) > 1e-9 or f == 0 else f
+    return o
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, status: int, payload: dict | None = None):
+        body = json.dumps(_clean(payload)).encode() if payload is not None else b""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send(204)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        try:
+            if path == "/api/health":
+                self._send(200, {"status": "ok", "version": VERSION, "provider": PROVIDER, "provider_status": "ok"})
+            elif path == "/api/market/summary":
+                self._send(200, {
+                    "source": DATA_SOURCE, "provider": PROVIDER,
+                    "latest_observation": DATES[-1].isoformat(),
+                    "last_refresh": LAST_REFRESH["t"] and time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(LAST_REFRESH["t"])) or None,
+                    "coverage": _coverage(), "quality": _quality(),
+                })
+            elif path == "/api/market/prices":
+                q = parse_qs(urlparse(self.path).query)
+                commodity = (q.get("commodity") or ["gold"])[0]
+                if commodity not in COMMODITIES:
+                    return self._send(400, {"detail": f"Unknown commodity '{commodity}'."})
+                pts = _points(commodity, (q.get("period") or ["1y"])[0], (q.get("interval") or ["daily"])[0])
+                self._send(200, {"commodity": commodity, "interval": (q.get("interval") or ["daily"])[0],
+                                 "source": DATA_SOURCE, "points": pts})
+            elif path == "/api/models/experiments" or path == "/api/risk/summary":
+                self._send(200, run_model(path, {}))
+            else:
+                self._send(404, {"detail": "Not found"})
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            self._send(500, {"detail": str(e)})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw or b"{}") if raw.strip() else {}
+        except json.JSONDecodeError:
+            return self._send(400, {"detail": "Invalid JSON body."})
+        try:
+            if path == "/api/market/refresh":
+                with FIRST_REFRESH_LOCK:
+                    now = time.time()
+                    elapsed = now - LAST_REFRESH["t"]
+                    if elapsed < 30 and LAST_REFRESH["t"]:
+                        return self._send(429, {"accepted": False,
+                                                "message": f"Refresh already in progress; retry in {int(30 - elapsed)}s.",
+                                                "retry_after_seconds": int(30 - elapsed)})
+                    LAST_REFRESH["t"] = now
+                self._send(200, {"accepted": True, "message": "Data is already current (deterministic synthetic series).",
+                                 "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(LAST_REFRESH["t"]))})
+            elif path == "/api/analysis/run":
+                self._send(200, run_analysis(body))
+            elif path.startswith("/api/models/") or path == "/api/risk/summary":
+                self._send(200, run_model(path, body))
+            else:
+                self._send(404, {"detail": "Not found"})
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            self._send(500, {"detail": str(e)})
+
+    def log_message(self, fmt, *args):  # quiet default access log
+        pass
+
+
+if __name__ == "__main__":
+    print(f"CommodiSense analysis backend v{VERSION} on http://0.0.0.0:8000")
+    ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
